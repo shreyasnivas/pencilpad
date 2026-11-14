@@ -14,7 +14,7 @@ with the iPad flat on the desk, but it works with any Mac display.
 Needs macOS and Python 3.10 or newer. On the Mac:
 
 ```sh
-git clone <this repository>
+git clone https://github.com/shreyasnivas/pencilpad.git
 cd pencilpad
 ./run.sh
 ```
