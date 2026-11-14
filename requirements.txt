@@ -1,0 +1,4 @@
+aiohttp
+pyobjc-framework-Quartz
+pyobjc-framework-Cocoa
+segno
