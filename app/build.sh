@@ -14,7 +14,9 @@ DEST=/Applications
 BUILD="$(mktemp -d)"
 APP="$BUILD/PencilPad.app"
 mkdir -p "$APP/Contents/MacOS"
-xcrun swiftc -O -o "$APP/Contents/MacOS/PencilPad" app/PencilPad.swift
+# Pin the deployment target: left alone, swiftc stamps the binary with the SDK's
+# version, and macOS refuses to open it on anything older.
+xcrun swiftc -O -target "$(uname -m)-apple-macos12.0" -o "$APP/Contents/MacOS/PencilPad" app/PencilPad.swift
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
