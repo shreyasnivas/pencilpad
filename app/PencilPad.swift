@@ -6,6 +6,31 @@
 
 import Cocoa
 import ApplicationServices
+import Speech
+
+// "PencilPad --transcribe file.wav": print what was said in a recording, then exit.
+// The Python script runs this for the Dictate corner when the iPad's microphone is used.
+// Exit code 3 means Speech Recognition is not allowed for PencilPad.
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--transcribe" {
+    let file = URL(fileURLWithPath: CommandLine.arguments[2])
+    SFSpeechRecognizer.requestAuthorization { status in
+        guard status == .authorized else { exit(3) }
+        guard let recognizer = SFSpeechRecognizer() ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US")),
+              recognizer.isAvailable else { exit(4) }
+        let request = SFSpeechURLRecognitionRequest(url: file)
+        request.shouldReportPartialResults = false
+        if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
+        if #available(macOS 13, *) { request.addsPunctuation = true }
+        recognizer.recognitionTask(with: request) { result, error in
+            if let result = result, result.isFinal {
+                print(result.bestTranscription.formattedString)
+                exit(0)
+            }
+            if error != nil { exit(0) }      // nothing was said
+        }
+    }
+    RunLoop.main.run()
+}
 
 let home = FileManager.default.homeDirectoryForCurrentUser
 let agentLabel = "io.github.pencilpad.app"
@@ -50,6 +75,7 @@ final class App: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(make("Show Setup Code…", #selector(showSetup), "s"))
         menu.addItem(make("Copy iPad Link", #selector(copyLink), "c"))
+        menu.addItem(make("Pair with Another Mac…", #selector(pairMac), ""))
         menu.addItem(.separator())
         menu.addItem(make("Restart PencilPad", #selector(restart), "r"))
         loginItem.target = self
@@ -102,6 +128,9 @@ final class App: NSObject, NSApplicationDelegate {
         env["PYTHONUNBUFFERED"] = "1"
         env["PENCILPAD_NO_OPEN"] = "1"
         env["PENCILPAD_EXIT_WITH_PARENT"] = "1"
+        if let me = Bundle.main.executablePath {
+            env["PENCILPAD_TRANSCRIBE"] = "'" + me.replacingOccurrences(of: "'", with: "'\\''") + "' --transcribe"
+        }
         p.environment = env
         if let log = try? FileHandle(forWritingTo: logURL) {
             log.truncateFile(atOffset: 0)
@@ -190,6 +219,38 @@ final class App: NSObject, NSApplicationDelegate {
                 self.show("Link copied")
             }
         }.resume()
+    }
+
+    // Use the same link as another Mac, so one pad on the iPad can reach both.
+    @objc func pairMac() {
+        let alert = NSAlert()
+        alert.messageText = "Pair with Another Mac"
+        alert.informativeText = "On the other Mac, choose Copy iPad Link from the PencilPad menu, then paste the link here. "
+            + "This Mac will then use the same link, and the pad on your iPad can switch between the two."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "http://…"
+        if let clip = NSPasteboard.general.string(forType: .string), clip.hasPrefix("http") { field.stringValue = clip }
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Pair")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: repo + "/.venv/bin/python")
+        p.arguments = [repo + "/pencilpad.py", "--pair", field.stringValue]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { show("Could not pair", detail: "\(error.localizedDescription)"); return }
+        p.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let done = NSAlert()
+        done.messageText = p.terminationStatus == 0 ? "Paired" : "Could not pair"
+        done.informativeText = p.terminationStatus == 0
+            ? "Open PencilPad on the iPad and tap the Mac's name at the top to switch between your Macs."
+            : out.trimmingCharacters(in: .whitespacesAndNewlines)
+        done.runModal()
+        if p.terminationStatus == 0 { restart() }
     }
 
     @objc func restart() {

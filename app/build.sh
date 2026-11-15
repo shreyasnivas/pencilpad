@@ -7,7 +7,7 @@ set -e
 cd "$(dirname "$0")/.."
 REPO="$PWD"
 [ -x .venv/bin/python ] || python3 -m venv .venv
-.venv/bin/python -c "import aiohttp, Quartz, AppKit, segno" 2>/dev/null || .venv/bin/pip install -q -r requirements.txt
+.venv/bin/python -c "import aiohttp, Quartz, AppKit, segno, cryptography" 2>/dev/null || .venv/bin/pip install -q -r requirements.txt
 
 DEST=/Applications
 [ -w "$DEST" ] || { DEST="$HOME/Applications"; mkdir -p "$DEST"; }
@@ -30,6 +30,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSSpeechRecognitionUsageDescription</key><string>PencilPad turns what you say into the iPad's microphone into text and types it on this Mac.</string>
   <key>PencilPadRepo</key><string>$REPO</string>
 </dict></plist>
 PLIST

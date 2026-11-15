@@ -52,6 +52,7 @@ Needs the Xcode command line tools (`xcode-select --install`). Then:
   pad by itself once it is allowed.
 - Choose **Start at Login** from the menu.
 - **Show Setup Code** opens the QR code page.
+- **Pair with Another Mac** lets one pad on the iPad reach two Macs.
 
 The app is built on your Mac and is not signed with a developer certificate. It
 runs the script from this folder, so keep the folder where it is; if you move
@@ -77,8 +78,45 @@ While the Pencil is down, finger and palm touches are ignored.
 | --- | --- |
 | Top left | Escape |
 | Top right | Screenshot: pick a region, it is copied and pasted into the front app with Ctrl+V |
-| Bottom left | Dictate: holds a key while pressed (F13 by default) for push-to-talk dictation apps |
+| Bottom left | Dictate: hold to talk. See below for which microphone it uses |
 | Bottom right | Return |
+
+## The secure connection: iPad microphone and several Macs
+
+Two features need the iPad to trust this Mac, because Safari only gives a page
+the microphone, and only lets it talk to more than one computer, over HTTPS:
+
+- **Dictate with the iPad's microphone.** Hold the Dictate corner and speak.
+  The pad records on the iPad, the Mac turns the recording into text with
+  Apple's speech recognition and types it into the front app. This needs the
+  menu bar app, which asks for Speech Recognition the first time. Recognition
+  runs on the Mac itself when the language supports it; otherwise macOS sends
+  the audio to Apple. Without the secure connection, or when PencilPad runs
+  from a terminal, the corner holds a key instead (F13 by default), for
+  push-to-talk dictation apps on the Mac.
+- **One pad for several Macs.** The pad connects to the Mac you chose last, and
+  to another paired Mac when that one is not reachable. Tap the Mac's name at
+  the top of the pad to switch. The Home Screen app also keeps a copy of
+  itself, so it opens even when the Mac it was added from is asleep.
+
+Set it up once per iPad and Mac: open the pad, tap the Mac's name at the top,
+then **Set Up the Secure Connection**, and follow the four steps. PencilPad
+makes a small certificate authority on the Mac (in `~/.pencilpad`) and the iPad
+is asked to trust it. Then add the pad to the Home Screen again from the secure
+page, and delete the old icon.
+
+To add a second Mac, install PencilPad on it, then give it the first Mac's
+link (Copy iPad Link in the menu bar app):
+
+```sh
+./run.sh --pair 'http://192.168.1.20:8765/your-token'
+```
+
+or choose **Pair with Another Mac** in its menu bar app. Both Macs then share
+one link. On the iPad, open the second Mac's setup page once and trust its
+certificate too. The pad tries each Mac's `.local` name, its Tailscale name and
+address when Tailscale is installed, and its Wi-Fi address, so it keeps working
+when one of those is unavailable, for example behind a VPN.
 
 ## Settings
 
@@ -91,9 +129,12 @@ Edit the block at the top of `pencilpad.py`:
   toggled.
 - `SCREENSHOT_PASTE`: whether a screenshot is pasted after capture.
 
-Environment variables: `PENCILPAD_PORT` (default 8765), `PENCILPAD_NO_OPEN=1`
-(do not open the setup page), `PENCILPAD_DRY_RUN=1` (serve the page but send
-nothing to the Mac).
+Environment variables: `PENCILPAD_PORT` (default 8765), `PENCILPAD_TLS_PORT`
+(the secure port, default one above the port; `off` to disable),
+`PENCILPAD_HOSTS` (comma-separated names and addresses to offer the iPad,
+instead of the ones PencilPad finds), `PENCILPAD_NO_OPEN=1` (do not open the
+setup page), `PENCILPAD_DRY_RUN=1` (serve the page but send nothing to the
+Mac).
 
 ## Security
 
@@ -102,7 +143,15 @@ Read this before using PencilPad on a network you do not control.
 - The link contains a random token, saved in `~/.pencilpad-token`. Anyone on
   the same network who has the link can control the Mac's pointer and press
   the corner keys. Keep it private. Delete the file to get a new token.
-- The connection is plain HTTP and is not encrypted.
+- The first connection is plain HTTP and is not encrypted. After you set up
+  the secure connection the pad uses HTTPS.
+- The secure connection asks the iPad to trust a certificate authority made on
+  your Mac. Its private key stays in `~/.pencilpad` on that Mac. The authority
+  is restricted to `.local` and Tailscale names and to private network
+  addresses, so it cannot be used to impersonate websites. To undo it, remove
+  the profile in the iPad's Settings under General, VPN & Device Management.
+- Pairing two Macs gives them the same link. Anyone with the link can control
+  both.
 - Use it on a trusted home or office network only.
 
 ## Tests

@@ -47,7 +47,11 @@ def server_env(port, token_file, **extra):
     assert int(port) != LIVE_PORT
     env = dict(os.environ, PENCILPAD_DRY_RUN="1", PENCILPAD_PORT=str(port),
                PENCILPAD_TOKEN_FILE=str(token_file), PENCILPAD_NO_OPEN="1",
-               PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1")
+               PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1",
+               # its own identity and peers, and no secure port unless a test asks
+               PENCILPAD_HOME=str(Path(token_file).parent / f"home-{port}"),
+               PENCILPAD_TLS_PORT="off", PENCILPAD_HOSTS="127.0.0.1")
+    env.pop("PENCILPAD_TRANSCRIBE", None)
     env.update(extra)
     return env
 
@@ -163,7 +167,9 @@ def wait_until(pred, timeout=5.0, what="condition"):
 def browser():
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        b = p.chromium.launch()
+        # a pretend microphone, allowed without asking, for the Dictate tests
+        b = p.chromium.launch(args=["--use-fake-ui-for-media-stream",
+                                    "--use-fake-device-for-media-stream"])
         yield b
         b.close()
 

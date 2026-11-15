@@ -384,7 +384,10 @@ def test_websocket_sends_boot_id_first(server):
             msg = await ws.receive_json(timeout=3)
             await ws.close()
             return msg
-    assert run(go()) == {"boot": page_cfg(server)["boot"]}
+    msg = run(go())
+    assert msg["boot"] == page_cfg(server)["boot"]
+    # and who it is, so a pad that knows several Macs can tell them apart
+    assert msg["id"] == page_cfg(server)["self"]["id"] and msg["peers"] == []
 
 
 def test_boot_id_changes_on_restart():
@@ -445,7 +448,9 @@ def test_state_after_server_side_drop(server):
 
 def test_ping(server):
     status, headers, body = server.get("/ping")
-    assert (status, body) == (200, "ok")
+    who = json.loads(body)
+    assert status == 200 and who["port"] == server.port and who["hosts"] == ["127.0.0.1"]
+    assert re.fullmatch(r"[0-9a-f]{12}", who["id"]) and who["tls"] == 0 and who["speech"] is False
     assert headers["Access-Control-Allow-Origin"] == "*"     # the pad pings across origins
 
 

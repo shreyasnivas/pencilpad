@@ -8,20 +8,31 @@ Recording permission for the Screenshot corner.
 """
 
 import asyncio
+import datetime
 import errno
+import hashlib
+import ipaddress
 import json
 import math
 import os
 import secrets
+import shlex
+import shutil
+import signal
 import socket
+import ssl
+import struct
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import Quartz
 from AppKit import NSPasteboard
-from aiohttp import WSMsgType, web
+from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
 # ---------------------------------------------------------------- settings
 PORT = int(os.environ.get("PENCILPAD_PORT", 8765))
@@ -56,6 +67,15 @@ MOD_FLAGS = {
 }
 TAP = Quartz.kCGHIDEventTap
 TOKEN_FILE = Path(os.environ.get("PENCILPAD_TOKEN_FILE") or Path.home() / ".pencilpad-token")
+# This Mac's id, its certificate, and the other Macs it has been paired with.
+HOME = Path(os.environ.get("PENCILPAD_HOME") or Path.home() / ".pencilpad")
+# The secure (HTTPS) port: the iPad needs it for the microphone and for switching
+# between Macs. PENCILPAD_TLS_PORT=off turns it off.
+TLS_PORT = os.environ.get("PENCILPAD_TLS_PORT", str(PORT + 1))
+TLS_PORT = int(TLS_PORT) if TLS_PORT.isdigit() and int(TLS_PORT) else 0
+# A command that takes a WAV file and prints what was said. The menu bar app sets it;
+# without it the Dictate corner presses the DICTATION key instead.
+TRANSCRIBE = shlex.split(os.environ.get("PENCILPAD_TRANSCRIBE", ""))
 # PENCILPAD_DRY_RUN=1: serve the page but post nothing to the Mac. The events it would
 # have posted are recorded instead (stdout lines starting "DRY", and GET /<token>/dry).
 DRY_RUN = os.environ.get("PENCILPAD_DRY_RUN") == "1"
@@ -205,6 +225,21 @@ class Mac:
         self.key(name, True, mods)
         self.key(name, False, mods)
 
+    def type_text(self, text):
+        """Types text into the front app, whatever the keyboard layout."""
+        if DRY_RUN:
+            dry_record({"ev": "text", "s": text})
+            return
+        units = text.encode("utf-16-le")
+        for i in range(0, len(units), 40):           # 20 UTF-16 units per event
+            chunk = units[i:i + 40].decode("utf-16-le", "surrogatepass")
+            for is_down in (True, False):
+                ev = Quartz.CGEventCreateKeyboardEvent(None, 0, is_down)
+                Quartz.CGEventSetFlags(ev, 0)
+                Quartz.CGEventKeyboardSetUnicodeString(ev, len(chunk.encode("utf-16-le")) // 2, chunk)
+                Quartz.CGEventPost(TAP, ev)
+            time.sleep(0.004)
+
     def release_all(self):
         self.up()
         for name, mods in list(self.held_keys):
@@ -280,7 +315,9 @@ async def page(request):
     if request.match_info["token"] != request.app["token"]:
         raise web.HTTPNotFound()
     cfg = {"hover": HOVER_MOVES, "dictMode": DICTATION["mode"], "boot": BOOT_ID, "mac": MAC_NAME,
-           "local": local_hostname() or ""}
+           "local": local_hostname() or "",
+           "self": {k: v for k, v in info(request.app).items() if k != "boot"},
+           "peers": list(request.app["peers"].values())}
     html = PAGE.replace("__CFG__", json.dumps(cfg))
     return web.Response(text=html, content_type="text/html",
                         headers={"Cache-Control": "no-store"})
@@ -296,7 +333,8 @@ async def ws_handler(request):
         dry_record({"ev": "connect"})
     mac.release_all()        # a dropped connection may have left a drag or key held
     request.app["clients"].add(ws)
-    await ws.send_json({"boot": BOOT_ID})
+    ws.secure = request.secure
+    await ws.send_json(dict(info(request.app), peers=list(request.app["peers"].values())))
     try:
         async for m in ws:
             if m.type != WSMsgType.TEXT:
@@ -410,6 +448,10 @@ def pad_url(app):
     return f"http://{lan_ip()}:{PORT}/{app['token']}"
 
 
+def secure_url(app):
+    return f"http://{lan_ip()}:{PORT}/{app['token']}/secure"
+
+
 async def connect_page(request):
     """The Mac-side screen: a QR code for the iPad, live status and permissions."""
     check_token(request)
@@ -429,14 +471,338 @@ async def state(request):
     return web.json_response({
         "clients": len(request.app["clients"]),
         "url": pad_url(request.app) if is_local(request) else "",
+        "tls": request.app["tls"], "speech": bool(TRANSCRIBE),
+        "secure": any(getattr(c, "secure", False) for c in request.app["clients"]),
+        "peers": [p["name"] for p in request.app["peers"].values()],
         "access": bool(getattr(Quartz, "CGPreflightPostEventAccess", lambda: True)()),
         "screen": bool(getattr(Quartz, "CGPreflightScreenCaptureAccess", lambda: True)()),
     })
 
 
+CORS = {"Access-Control-Allow-Origin": "*"}
+
+
 async def ping(request):
+    """Who this is and where it can be reached. The pad uses it to find its Macs."""
     check_token(request)
-    return web.Response(text="ok", headers={"Access-Control-Allow-Origin": "*"})
+    return web.json_response(info(request.app), headers=CORS)
+
+
+# ---- this Mac, and the other Macs it is paired with
+def mac_id():
+    f = HOME / "id"
+    if not f.exists():
+        HOME.mkdir(parents=True, exist_ok=True)
+        f.write_text(secrets.token_hex(6))
+    return f.read_text().strip()
+
+
+def tailscale_names():
+    """This Mac's Tailscale name and address, when Tailscale is running."""
+    exe = shutil.which("tailscale") or next((p for p in (
+        "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale") if os.path.exists(p)), None)
+    if not exe:
+        return []
+    try:
+        out = subprocess.run([exe, "status", "--json", "--peers=false"], capture_output=True,
+                             text=True, timeout=4).stdout
+        me = (json.loads(out).get("Self") or {}) if out.strip() else {}
+        names = [me.get("DNSName", "").rstrip(".")] + [a for a in me.get("TailscaleIPs") or [] if ":" not in a]
+        return [n for n in names if n]
+    except Exception:
+        return []
+
+
+def find_hosts():
+    """Every name and address the iPad might reach this Mac at, steadiest first."""
+    if os.environ.get("PENCILPAD_HOSTS"):          # set by hand, e.g. for an unusual network
+        return [h.strip().lower() for h in os.environ["PENCILPAD_HOSTS"].split(",") if h.strip()]
+    hosts = [local_hostname(), *tailscale_names(), lan_ip()]
+    seen = []
+    for h in hosts:
+        h = (h or "").lower()
+        if h and h != "127.0.0.1" and h not in seen:
+            seen.append(h)
+    return seen
+
+
+def info(app):
+    return {"id": app["id"], "name": MAC_NAME, "hosts": app["hosts"], "port": PORT,
+            "tls": app["tls"], "boot": BOOT_ID, "speech": bool(TRANSCRIBE)}
+
+
+def clean_peer(d):
+    """A peer record from the network: keep only well-formed fields."""
+    peer = {"id": str(d["id"])[:40], "name": str(d.get("name") or "Mac")[:80],
+            "hosts": [str(h)[:255] for h in d.get("hosts") or [] if isinstance(h, str)][:12],
+            "port": int(d["port"]), "tls": int(d.get("tls") or 0)}
+    if not peer["id"] or not peer["hosts"] or not 0 < peer["port"] < 65536:
+        raise ValueError("not a PencilPad Mac")
+    return peer
+
+
+def load_peers():
+    try:
+        raw = json.loads((HOME / "macs.json").read_text())
+        return {p["id"]: p for p in map(clean_peer, raw.values())}
+    except Exception:
+        return {}
+
+
+def save_peers(peers):
+    HOME.mkdir(parents=True, exist_ok=True)
+    (HOME / "macs.json").write_text(json.dumps(peers, indent=1))
+
+
+async def macs(request):
+    check_token(request)
+    return web.json_response({"self": info(request.app), "peers": list(request.app["peers"].values())},
+                             headers=CORS)
+
+
+async def add_peer(request):
+    """Another Mac with the same link introduces itself; reply with who we are."""
+    check_token(request)
+    try:
+        peer = clean_peer(await request.json())
+    except Exception:
+        raise web.HTTPBadRequest()
+    app = request.app
+    if peer["id"] != app["id"] and app["peers"].get(peer["id"]) != peer:
+        app["peers"][peer["id"]] = peer
+        save_peers(app["peers"])
+    return web.json_response(info(app))
+
+
+async def keep_current(app):
+    """Notices when this Mac's addresses change, and keeps in touch with paired Macs."""
+    loop = asyncio.get_running_loop()
+    timeout = ClientTimeout(total=3)
+    while True:
+        await asyncio.sleep(float(os.environ.get("PENCILPAD_REFRESH", 20)))
+        try:
+            hosts = await loop.run_in_executor(None, find_hosts)
+            if hosts and hosts != app["hosts"]:
+                app["hosts"] = hosts
+                if app["tls_ctx"]:
+                    await loop.run_in_executor(None, issue_cert, hosts)
+                    app["tls_ctx"].load_cert_chain(HOME / "cert.pem", HOME / "key.pem")
+            me = info(app)
+            async with ClientSession(timeout=timeout) as session:
+                for peer in list(app["peers"].values()):
+                    for host in peer["hosts"]:
+                        try:
+                            url = f"http://{host}:{peer['port']}/{app['token']}/peer"
+                            async with session.post(url, json=me) as r:
+                                new = clean_peer(await r.json())
+                        except Exception:
+                            continue
+                        if new["id"] == peer["id"] and new != peer:
+                            app["peers"][peer["id"]] = new
+                            save_peers(app["peers"])
+                        break
+        except Exception as e:
+            print("refresh failed:", repr(e), flush=True)
+
+
+def pair(link):
+    """./run.sh --pair <link from the other Mac>: share its link and introduce the two."""
+    u = urlsplit(link.strip())
+    token = u.path.strip("/").split("/")[0]
+    if u.scheme not in ("http", "https") or not u.netloc or not token:
+        sys.exit("That is not a PencilPad link. Use Copy iPad Link on the other Mac.")
+    base = f"{u.scheme}://{u.netloc}/{token}"
+    ctx = ssl._create_unverified_context()     # the other Mac's own certificate; the link is the secret
+    me = {"id": mac_id(), "name": MAC_NAME, "hosts": find_hosts(), "port": PORT, "tls": TLS_PORT}
+    try:
+        req = urllib.request.Request(base + "/peer", data=json.dumps(me).encode(),
+                                     headers={"Content-Type": "application/json"})
+        other = clean_peer(json.loads(urllib.request.urlopen(req, timeout=6, context=ctx).read()))
+    except Exception as e:
+        sys.exit(f"Could not reach PencilPad on the other Mac ({e}).\n"
+                 "Check that it is running there and that both Macs are on the same network.")
+    if other["id"] == me["id"]:
+        sys.exit("That link is this Mac's own.")
+    TOKEN_FILE.write_text(token)
+    TOKEN_FILE.chmod(0o600)
+    peers = load_peers()
+    peers[other["id"]] = other
+    save_peers(peers)
+    print(f"Paired with {other['name']}. Restart PencilPad on this Mac to use the shared link.")
+
+
+# ---- the secure port. The iPad only gives a page the microphone, and lets it talk to
+# more than one Mac, over HTTPS. Each Mac makes its own small certificate authority,
+# which the iPad is asked to trust once. It can only vouch for names on private networks.
+def tls_names(hosts):
+    from cryptography import x509
+    names = []
+    for h in [*hosts, "localhost", "127.0.0.1"]:
+        try:
+            names.append(x509.IPAddress(ipaddress.ip_address(h)))
+        except ValueError:
+            names.append(x509.DNSName(h))
+    return names
+
+
+def make_ca():
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    HOME.mkdir(parents=True, exist_ok=True)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"PencilPad ({MAC_NAME or 'Mac'})"[:64]),
+                      x509.NameAttribute(NameOID.ORGANIZATION_NAME, "PencilPad")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    allowed = [x509.DNSName("local"), x509.DNSName("ts.net"), x509.DNSName("localhost")] + [
+        x509.IPAddress(ipaddress.ip_network(n)) for n in
+        ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8")]
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, key_cert_sign=True, crl_sign=True,
+                                         content_commitment=False, key_encipherment=False,
+                                         data_encipherment=False, key_agreement=False,
+                                         encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(x509.NameConstraints(permitted_subtrees=allowed, excluded_subtrees=None),
+                           critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+            .sign(key, hashes.SHA256()))
+    (HOME / "ca.key").write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    (HOME / "ca.key").chmod(0o600)
+    (HOME / "ca.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+
+def issue_cert(hosts):
+    """Writes cert.pem and key.pem for these names, signed by this Mac's authority."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+    if not (HOME / "ca.pem").exists() or not (HOME / "ca.key").exists():
+        make_ca()
+    ca = x509.load_pem_x509_certificate((HOME / "ca.pem").read_bytes())
+    ca_key = serialization.load_pem_private_key((HOME / "ca.key").read_bytes(), None)
+    names = tls_names(hosts)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:                                       # keep the one we have if it still fits
+        old = x509.load_pem_x509_certificate((HOME / "cert.pem").read_bytes())
+        san = old.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        if (set(names) <= set(san) and old.issuer == ca.subject and (HOME / "key.pem").exists()
+                and old.not_valid_after_utc - now > datetime.timedelta(days=30)):
+            return
+    except Exception:
+        pass
+    key = ec.generate_private_key(ec.SECP256R1())
+    cert = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "PencilPad")]))
+            .issuer_name(ca.subject).public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=390))
+            .add_extension(x509.SubjectAlternativeName(names), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, key_cert_sign=False, crl_sign=False,
+                                         content_commitment=False, key_encipherment=False,
+                                         data_encipherment=False, key_agreement=False,
+                                         encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca.public_key()),
+                           critical=False)
+            .sign(ca_key, hashes.SHA256()))
+    (HOME / "key.pem").write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    (HOME / "key.pem").chmod(0o600)
+    (HOME / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+
+def tls_context(hosts):
+    """The HTTPS context, or None when it is switched off or cannot be set up."""
+    if not TLS_PORT:
+        return None
+    try:
+        issue_cert(hosts)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(HOME / "cert.pem", HOME / "key.pem")
+        return ctx
+    except ImportError:
+        print("(No secure port: the 'cryptography' package is missing. Run ./run.sh to install it.)\n")
+    except Exception as e:
+        print(f"(No secure port: {e!r})\n")
+    return None
+
+
+async def ca_cert(request):
+    """This Mac's certificate authority, for the iPad to install and trust."""
+    check_token(request)
+    try:
+        pem = (HOME / "ca.pem").read_bytes()
+    except OSError:
+        raise web.HTTPNotFound()
+    der = ssl.PEM_cert_to_DER_cert(pem.decode())
+    return web.Response(body=der, content_type="application/x-x509-ca-cert",
+                        headers={"Content-Disposition": 'attachment; filename="PencilPad.crt"'})
+
+
+async def secure_page(request):
+    check_token(request)
+    html = SECURE.replace("__MACNAME__", MAC_NAME or "your Mac").replace("__CFG__", json.dumps(
+        {"tls": request.app["tls"], "mac": MAC_NAME or "Mac"}))
+    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+async def service_worker(request):
+    check_token(request)
+    return web.Response(text=SERVICE_WORKER, content_type="application/javascript",
+                        headers={"Cache-Control": "no-store", "Service-Worker-Allowed": "/"})
+
+
+# ---- Dictate with the iPad's microphone: the pad sends what it recorded, the Mac
+# turns it into text and types it.
+async def speech(request):
+    check_token(request)
+    if not TRANSCRIBE:
+        return web.json_response({"text": "", "error": "unavailable"}, headers=CORS)
+    try:
+        rate = int(request.query.get("rate", 0))
+    except ValueError:
+        rate = 0
+    pcm = await request.read()
+    if not 8000 <= rate <= 96000 or len(pcm) < 2:
+        raise web.HTTPBadRequest()
+    pcm = pcm[:len(pcm) & ~1]
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt "
+                + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+                + b"data" + struct.pack("<I", len(pcm)) + pcm)
+    text, error = "", ""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *TRANSCRIBE, f.name, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), 45)
+        except asyncio.TimeoutError:
+            proc.kill()
+            out, err, error = b"", b"", "timeout"
+        text = " ".join(out.decode("utf-8", "replace").split())
+        if proc.returncode == 3:
+            error = "denied"
+        elif proc.returncode and not error:
+            error = "failed"
+            print("transcribe failed:", err.decode("utf-8", "replace").strip()[:300], flush=True)
+    except OSError as e:
+        error = "failed"
+        print("transcribe could not start:", repr(e), flush=True)
+    finally:
+        os.unlink(f.name)
+    if text:
+        mac.type_text(text + " ")
+    return web.json_response({"text": text, "error": error}, headers=CORS)
 
 
 SETTINGS_PANES = {"accessibility": "Privacy_Accessibility", "screen": "Privacy_ScreenCapture"}
@@ -464,7 +830,33 @@ async def exit_with_parent(app):
     app["parent_watch"] = asyncio.ensure_future(watch())
 
 
+async def serve(app, sock, tls_sock):
+    runner = web.AppRunner(app, handle_signals=False)
+    await runner.setup()
+    await web.SockSite(runner, sock).start()
+    if tls_sock:
+        await web.SockSite(runner, tls_sock, ssl_context=app["tls_ctx"]).start()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, stop.set)
+    refresh = asyncio.ensure_future(keep_current(app))
+    await stop.wait()
+    refresh.cancel()
+    await runner.cleanup()
+    mac.release_all()
+
+
+def bind(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", port))
+    return sock
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--pair":
+        return pair(sys.argv[2])
     if (DICTATION["mode"] not in ("hold", "toggle") or DICTATION["key"] not in KEYCODES
             or any(m not in MOD_FLAGS for m in DICTATION.get("mods", []))):
         sys.exit(f"The DICTATION setting is not valid: {DICTATION}\n"
@@ -478,23 +870,36 @@ def main():
               "   (for the PencilPad app, or for the terminal that runs this script),\n"
               "   then start PencilPad again.\n"
               "   (The pad will connect, but the pointer will not move until then.)\n")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        sock.bind(("0.0.0.0", PORT))
+        sock = bind(PORT)
     except OSError as e:
         if e.errno == errno.EADDRINUSE:
             sys.exit(f"Port {PORT} is already in use. PencilPad is probably already running.\n"
                      f"Stop the other copy, or pick another port: PENCILPAD_PORT=8766 ./run.sh")
         raise
     token = load_token()
-    app = web.Application()
+    app = web.Application(client_max_size=48 * 1024 * 1024)
     app["token"] = token
     app["clients"] = set()
+    app["id"] = mac_id()
+    app["hosts"] = find_hosts()
+    app["peers"] = {i: p for i, p in load_peers().items() if i != app["id"]}
+    app["tls_ctx"] = tls_context(app["hosts"])
+    tls_sock = None
+    if app["tls_ctx"]:
+        try:
+            tls_sock = bind(TLS_PORT)
+        except OSError:
+            print(f"(No secure port: {TLS_PORT} is already in use.)\n")
+            app["tls_ctx"] = None
+    app["tls"] = TLS_PORT if tls_sock else 0
     app.add_routes([
         web.get("/{token}", page), web.get("/{token}/ws", ws_handler),
         web.get("/{token}/connect", connect_page), web.get("/{token}/state", state),
         web.get("/{token}/ping", ping), web.post("/{token}/settings/{pane}", open_settings),
+        web.get("/{token}/macs", macs), web.post("/{token}/peer", add_peer),
+        web.get("/{token}/ca.crt", ca_cert), web.get("/{token}/secure", secure_page),
+        web.get("/{token}/sw.js", service_worker), web.post("/{token}/speech", speech),
     ])
     if DRY_RUN:
         app.add_routes([web.get("/{token}/dry", dry_log_handler),
@@ -508,7 +913,7 @@ def main():
     print("Ctrl+C here to stop.\n", flush=True)
     if sys.stdout.isatty() and not DRY_RUN and not os.environ.get("PENCILPAD_NO_OPEN"):
         subprocess.Popen(["open", setup])      # started by hand: show the setup screen
-    web.run_app(app, sock=sock, print=None)
+    asyncio.run(serve(app, sock, tls_sock))
 
 
 CONNECT = r"""<!doctype html>
@@ -569,6 +974,8 @@ CONNECT = r"""<!doctype html>
     <div class="row"><i class="dot wait" id="dIpad"></i><div class="t"><span id="tIpad">Waiting for your iPad…</span><small>No camera handy? Type this into Safari on the iPad: <code>__URL__</code></small></div></div>
     <div class="row"><i class="dot" id="dAcc"></i><div class="t"><span id="tAcc">Checking Accessibility…</span><small>Needed to move the pointer and press keys.</small></div><button id="bAcc" hidden>Open Settings</button></div>
     <div class="row"><i class="dot" id="dScr"></i><div class="t"><span id="tScr">Checking Screen Recording…</span><small>Only needed for the Screenshot corner.</small></div><button id="bScr" hidden>Open Settings</button></div>
+    <div class="row" id="rSec" hidden><i class="dot" id="dSec"></i><div class="t"><span id="tSec">Secure connection</span><small>Lets Dictate use the iPad's microphone and lets the pad find your other Macs. On the iPad, tap the Mac's name at the top of the pad, then Set Up.</small></div></div>
+    <div class="row" id="rPeers" hidden><i class="dot ok"></i><div class="t"><span id="tPeers"></span><small>The pad connects to whichever of these it can reach, starting with the one you used last.</small></div></div>
   </div>
   <footer>PencilPad keeps running in the terminal. Anyone on your network with this link can control this Mac, so keep it private.</footer>
 </main>
@@ -585,6 +992,10 @@ async function poll() {
     row('Ipad', s.clients > 0, 'iPad connected', 'Waiting for your iPad…');
     row('Acc', s.access, 'Accessibility is allowed', 'Accessibility is off: the pointer will not move');
     row('Scr', s.screen, 'Screen Recording is allowed', 'Screen Recording is off');
+    document.getElementById('rSec').hidden = !s.tls;
+    row('Sec', s.secure, 'iPad connected securely', 'Secure connection not set up on the iPad yet');
+    document.getElementById('rPeers').hidden = !s.peers.length;
+    document.getElementById('tPeers').textContent = 'Paired with ' + s.peers.join(', ');
   } catch (_) { row('Ipad', false, '', 'PencilPad is not running on this Mac'); }
   setTimeout(poll, 1500);
 }
@@ -594,6 +1005,111 @@ document.getElementById('bScr').onclick = () => fetch(base + '/settings/screen',
 </script>
 </body>
 </html>
+"""
+
+SECURE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Set Up PencilPad</title>
+<style>
+  :root { color-scheme:light dark;
+    --bg:#f2f2f7; --card:#fff; --label:#000; --label2:rgba(60,60,67,.6); --sep:rgba(60,60,67,.14);
+    --blue:#007aff; --green:#34c759; --fill:rgba(118,118,128,.12); }
+  @media (prefers-color-scheme: dark) { :root {
+    --bg:#000; --card:#1c1c1e; --label:#fff; --label2:rgba(235,235,245,.6); --sep:rgba(84,84,88,.5);
+    --blue:#0a84ff; --green:#30d158; --fill:rgba(118,118,128,.24); } }
+  body { margin:0; background:var(--bg); color:var(--label);
+    font:400 17px/1.35 -apple-system, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing:antialiased; }
+  main { width:min(620px, calc(100vw - 40px)); margin:0 auto; padding:44px 0; }
+  h1 { margin:0 0 8px; font-size:30px; font-weight:700; letter-spacing:-.02em; text-align:center; }
+  header p { margin:0 0 26px; color:var(--label2); text-align:center; }
+  .card { background:var(--card); border-radius:22px; padding:24px; margin-bottom:16px; }
+  ol { margin:0; padding:0; list-style:none; counter-reset:n; }
+  ol li { position:relative; padding:0 0 20px 42px; counter-increment:n; }
+  ol li:last-child { padding-bottom:0; }
+  ol li::before { content:counter(n); position:absolute; left:0; top:-1px; width:28px; height:28px; border-radius:50%;
+    background:var(--fill); font-size:15px; font-weight:600; display:flex; align-items:center; justify-content:center; }
+  ol b { font-weight:600; } ol span { display:block; color:var(--label2); font-size:15px; margin-top:2px; }
+  a.btn { display:flex; align-items:center; justify-content:center; height:50px; margin-top:12px; border-radius:14px;
+    background:var(--blue); color:#fff; font-weight:600; text-decoration:none; }
+  a.btn:active { opacity:.7; }
+  #wait { display:flex; align-items:center; gap:10px; color:var(--label2); font-size:15px; }
+  #wait i { width:10px; height:10px; border-radius:50%; background:var(--blue); animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity:.3; } }
+  #done h2 { margin:0 0 6px; font-size:22px; color:var(--green); }
+  #done p { margin:0; color:var(--label2); }
+  footer { color:var(--label2); font-size:13px; text-align:center; padding:0 12px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>Set Up the Secure Connection</h1>
+    <p>It lets Dictate use this iPad's microphone, and lets PencilPad find your Macs by itself.</p></header>
+  <div class="card" id="steps">
+    <ol>
+      <li><b>Download the certificate</b><span>Tap the button, then tap Allow.</span>
+        <a class="btn" id="get" href="#">Download Certificate</a></li>
+      <li><b>Install it</b><span>Open the Settings app. Tap Profile Downloaded near the top, then Install.</span></li>
+      <li><b>Trust it</b><span>In Settings, go to General, About, Certificate Trust Settings and turn on <span id="ca" style="display:inline;color:var(--label)"></span>.</span></li>
+      <li><b>Come back to this page</b><span>It moves on by itself once the iPad trusts the certificate.</span></li>
+    </ol>
+  </div>
+  <div class="card" id="wait"><i></i><span>Waiting for the certificate to be trusted…</span></div>
+  <div class="card" id="done" hidden><h2>All set</h2>
+    <p>Open PencilPad below, then tap Share and Add to Home Screen. If you already have a PencilPad icon, delete the old one first.</p>
+    <a class="btn" id="open" href="#">Open PencilPad</a></div>
+  <div class="card" id="off" hidden><p style="margin:0;color:var(--label2)">The secure connection is switched off on this Mac. Start PencilPad again with ./run.sh.</p></div>
+  <footer>The certificate was made by PencilPad on __MACNAME__, and its private key never leaves that Mac. It can only vouch for addresses on your own networks, not for websites.</footer>
+</main>
+<script>
+const CFG = __CFG__;
+const path = location.pathname.replace(/\/secure$/, '');
+document.getElementById('ca').textContent = 'PencilPad (' + CFG.mac + ')';
+document.getElementById('get').href = path + '/ca.crt';
+const pad = 'https://' + location.hostname + ':' + CFG.tls + path;
+document.getElementById('open').href = pad;
+function done() {
+  for (const id of ['steps', 'wait']) document.getElementById(id).hidden = true;
+  document.getElementById('done').hidden = false;
+}
+async function check() {
+  try { if ((await fetch(pad + '/ping', {cache: 'no-store'})).ok) return done(); } catch (_) {}
+  setTimeout(check, 1500);
+}
+if (!CFG.tls) { for (const id of ['steps', 'wait']) document.getElementById(id).hidden = true; document.getElementById('off').hidden = false; }
+else if (location.protocol === 'https:') done(); else check();
+document.addEventListener('visibilitychange', () => { if (!document.hidden && CFG.tls && location.protocol !== 'https:') check(); });
+</script>
+</body>
+</html>
+"""
+
+# Keeps a copy of the pad on the iPad, so the Home Screen app opens even when the Mac
+# it was added from is asleep or on another network. The pad then finds a Mac itself.
+SERVICE_WORKER = r"""
+const PAD = self.registration.scope.replace(/\/$/, '');
+const open = () => caches.open('pencilpad-1');
+self.addEventListener('install', e => { self.skipWaiting(); e.waitUntil(open().then(c => c.add(PAD)).catch(() => {})); });
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET' || e.request.mode !== 'navigate') return;
+  if (e.request.url.split(/[?#]/)[0].replace(/\/$/, '') !== PAD) return;
+  e.respondWith((async () => {
+    const cache = await open();
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 2500);
+    try {
+      const r = await fetch(PAD, {signal: ctl.signal, cache: 'no-store'});
+      if (r.ok) await cache.put(PAD, r.clone());
+      return r;
+    } catch (_) {
+      return (await cache.match(PAD)) || Response.error();
+    } finally { clearTimeout(timer); }
+  })());
+});
 """
 
 PAGE = r"""<!doctype html>
@@ -663,7 +1179,7 @@ PAGE = r"""<!doctype html>
   #status { display:flex; align-items:center; gap:8px; height:36px; padding:0 16px 0 13px; border-radius:18px;
     background:var(--material); -webkit-backdrop-filter:blur(24px) saturate(180%); backdrop-filter:blur(24px) saturate(180%);
     box-shadow:inset 0 0 0 1px var(--raised-edge);
-    font-size:15px; font-weight:500; color:var(--label); white-space:nowrap; pointer-events:none; }
+    font-size:15px; font-weight:500; color:var(--label); white-space:nowrap; pointer-events:auto; touch-action:none; }
   #dot { width:9px; height:9px; border-radius:50%; background:var(--green); transition:background-color .2s ease; }
   body.offline #dot { background:var(--orange); animation:pulse 1.2s ease-in-out infinite; }
   #pad.armed ~ #status #dot { background:var(--blue); }
@@ -701,6 +1217,22 @@ PAGE = r"""<!doctype html>
     font:600 17px -apple-system, system-ui, sans-serif; touch-action:none; }
   #help::after { content:""; position:absolute; inset:-6px; }
   #help:active { opacity:.6; }
+
+  /* the list of Macs, opened from the status pill */
+  #macs { position:fixed; top:calc(var(--t) + 64px); left:50%; transform:translateX(-50%) scale(.96); width:min(360px, 84vw);
+    padding:8px; border-radius:22px; box-sizing:border-box; touch-action:none;
+    background:var(--material); -webkit-backdrop-filter:blur(30px) saturate(180%); backdrop-filter:blur(30px) saturate(180%);
+    box-shadow:inset 0 0 0 1px var(--raised-edge), 0 18px 50px rgba(0,0,0,.28);
+    opacity:0; visibility:hidden; transition:opacity .2s ease, transform .2s ease, visibility 0s linear .2s; }
+  body.picking #macs { opacity:1; visibility:visible; transform:translateX(-50%); transition-delay:0s; }
+  #macs .mac { display:flex; align-items:center; gap:12px; min-height:52px; padding:6px 14px; border-radius:14px; }
+  #macs .mac:active { background:var(--raised); }
+  #macs .mac b { flex:1; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #macs .mac span { font-size:15px; color:var(--label2); }
+  #macs .mac.cur span { color:var(--green); }
+  #macs .mac.gone b { color:var(--label2); }
+  #macs .more { color:var(--blue); border-top:1px solid var(--raised-edge); border-radius:0 0 14px 14px; }
+  #macs p { margin:6px 14px 8px; font-size:13px; color:var(--label2); }
 
   /* hold progress ring, drawn where the tip rests */
   #ring { position:fixed; width:76px; height:76px; margin:-38px 0 0 -38px; pointer-events:none;
@@ -794,6 +1326,9 @@ PAGE = r"""<!doctype html>
 <div class="corner" id="shot"><svg viewBox="0 0 34 34"><path d="M5 11V8a3 3 0 0 1 3-3h3M23 5h3a3 3 0 0 1 3 3v3M29 23v3a3 3 0 0 1-3 3h-3M11 29H8a3 3 0 0 1-3-3v-3"/><circle cx="17" cy="17" r="5"/></svg>Screenshot</div>
 <div class="corner" id="dict"><svg viewBox="0 0 34 34"><rect x="12.5" y="4" width="9" height="16" rx="4.5"/><path d="M7.5 16.5a9.5 9.5 0 0 0 19 0M17 26v4M12.5 30h9"/></svg>Dictate<small id="dictSub"></small></div>
 <div class="corner" id="sub"><svg viewBox="0 0 34 34"><path d="M27 7v9a4 4 0 0 1-4 4H7M13 14l-6 6 6 6"/></svg>Return</div>
+<div id="macs"><div id="macList"></div>
+  <div class="mac more" id="secure" hidden><b>Set Up the Secure Connection…</b></div>
+  <p id="macNote"></p></div>
 <div id="lost"><div id="spin"></div><h1 id="lostTitle">Looking for your Mac…</h1>
   <p>Keep PencilPad running on the Mac and this iPad on the same Wi-Fi. It reconnects on its own.</p>
   <button id="reload">Reload</button></div>
@@ -812,32 +1347,132 @@ const CFG = __CFG__;
 const pad = document.getElementById('pad');
 const statusText = document.getElementById('statusText');
 let online = false;
+let cur = null;           // the Mac this pad is connected to: {id, name, base, speech}
 function showStatus(armed) {
+  const name = cur ? cur.name : CFG.mac;
   statusText.textContent = armed ? 'Lift to right-click · move to drag'
-    : online ? (CFG.mac ? 'Connected to ' + CFG.mac : 'Connected') : 'Reconnecting…';
+    : online ? (name ? 'Connected to ' + name : 'Connected') : 'Reconnecting…';
 }
 function setOnline(on) {
   online = on; document.body.classList.toggle('offline', !on); showStatus(false);
-  if (!on && CFG.mac) document.getElementById('lostTitle').textContent = 'Looking for ' + CFG.mac + '…';
+  const name = macs.length > 1 ? 'your Mac' : CFG.mac;
+  if (!on && name) document.getElementById('lostTitle').textContent = 'Looking for ' + name + '…';
 }
 function arm(on) { pad.classList.toggle('armed', on); showStatus(on); }
 document.getElementById('reload').addEventListener('click', () => location.reload());
-document.getElementById('dictSub').textContent = CFG.dictMode === 'toggle' ? 'Tap to start or stop' : 'Hold to talk';
+const dictSub = document.getElementById('dictSub');
+let dictNote = null;
+function dictLabel(note, ms) {
+  clearTimeout(dictNote);
+  dictSub.textContent = note || (CFG.dictMode === 'toggle' ? 'Tap to start or stop' : 'Hold to talk');
+  if (note && ms) dictNote = setTimeout(dictLabel, ms);
+}
+dictLabel();
 // Tolerances. SLOP_*: how far (px, straight line from where it landed) the tip may
 // wander and still count as a tap or a hold. HOLD_MS: hold-still time before the pad arms.
 const HOLD_MS = 500, TWO_TAP_MS = 600, SLOP_PEN = 18, SLOP_TOUCH = 20, TWO_SLOP = 20;
 
+// ---- the Macs this pad knows, and how to reach each one
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (_) { return null; } }
+const PATH = location.pathname.replace(/\/$/, '');
+const SECURE = location.protocol === 'https:';
+let macs = [];           // [{id, name, hosts, port, tls}], this page's own Mac first
+function learn(list) {
+  for (const m of list) {
+    if (!m || !m.id || !Array.isArray(m.hosts)) continue;
+    const rec = {id: m.id, name: m.name || 'Mac', hosts: m.hosts, port: m.port, tls: m.tls || 0};
+    const i = macs.findIndex(x => x.id === m.id);
+    if (i < 0) macs.push(rec); else macs[i] = rec;
+  }
+  store('pencilpad-macs', JSON.stringify(macs));
+}
+try { learn(JSON.parse(store('pencilpad-macs') || '[]')); } catch (_) {}
+learn([CFG.self, ...CFG.peers]);
+macs.sort((a, b) => (b.id === CFG.self.id) - (a.id === CFG.self.id));
+function preferred() { const id = store('pencilpad-mac'); return macs.some(m => m.id === id) ? id : CFG.self.id; }
+// every address worth trying for a Mac, the address this page came from first
+function bases(m) {
+  const out = m.id === CFG.self.id ? [location.origin] : [];
+  for (const h of m.hosts) {
+    const b = SECURE ? (m.tls ? 'https://' + h + ':' + m.tls : '') : 'http://' + h + ':' + m.port;
+    if (b && !out.includes(b)) out.push(b);
+  }
+  return out;
+}
+async function probe(base, id, ms) {
+  const ctl = new AbortController(); const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(base + PATH + '/ping', {signal: ctl.signal, cache: 'no-store'});
+    const who = r.ok ? await r.json() : null;
+    return !!who && who.id === id;
+  } catch (_) { return false; } finally { clearTimeout(timer); }
+}
+// The first reachable address, taking the Macs in the order given. Answers as soon
+// as everything ahead of a reachable address has failed.
+function find(order, ms) {
+  const tries = [];
+  for (const m of order) for (const base of bases(m)) tries.push({m, base, ok: null});
+  return new Promise(done => {
+    const settle = () => {
+      for (const t of tries) { if (t.ok) return done(t); if (t.ok === null) return; }
+      done(null);
+    };
+    if (!tries.length) return done(null);
+    for (const t of tries) probe(t.base, t.m.id, ms).then(ok => { t.ok = ok; settle(); });
+  });
+}
+function byPreference() { const id = preferred(); return [...macs].sort((a, b) => (b.id === id) - (a.id === id)); }
+
 // ---- connection
 let ws = null;
 let retry = null;
-function connect() {
+let finding = false;
+async function connect() {
   clearTimeout(retry);
-  if (ws && ws.readyState <= 1) return;          // already open or opening
-  const sock = ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + location.pathname.replace(/\/$/, '') + '/ws');
-  ws.onopen = () => { if (sock !== ws) return; setOnline(true); if (!tour && !store('pencilpad-tour')) tourStart(); };
-  ws.onclose = () => { if (sock !== ws) return; resetInput(); setOnline(false); retry = setTimeout(connect, 700); };
+  if (finding || (ws && ws.readyState <= 1)) return;          // already open or opening
+  let to = {m: macs[0], base: location.origin};
+  if (macs.length > 1 || connect.failed) {                      // more than one place to look
+    finding = true;
+    to = await find(byPreference(), 1500);
+    finding = false;
+    if (!to) { retry = setTimeout(connect, 700); return; }
+    if (ws && ws.readyState <= 1) return;
+  }
+  const sock = ws = new WebSocket(to.base.replace(/^http/, 'ws') + PATH + '/ws');
+  let opened = false;
+  ws.onopen = () => {
+    if (sock !== ws) return;
+    opened = true; connect.failed = false;
+    cur = {id: to.m.id, name: to.m.name, base: to.base, speech: false};
+    setOnline(true); if (!tour && !store('pencilpad-tour')) tourStart();
+  };
+  ws.onclose = () => {
+    if (sock !== ws) return;
+    if (!opened) connect.failed = true;       // next time, try this Mac's other addresses too
+    resetInput(); setOnline(false); retry = setTimeout(connect, 700);
+  };
   ws.onerror = () => sock.close();
-  ws.onmessage = m => { try { if (JSON.parse(m.data).boot !== CFG.boot) location.reload(); } catch (_) {} };
+  ws.onmessage = m => {
+    if (sock !== ws) return;
+    let hello; try { hello = JSON.parse(m.data); } catch (_) { return; }
+    if (!hello || !hello.boot) return;
+    if (hello.id) {
+      learn([hello, ...(hello.peers || [])]);
+      if (cur) { cur.name = hello.name || cur.name; cur.speech = !!hello.speech; showStatus(false); }
+      dictLabel();
+    }
+    // this page's own Mac restarted: load the page again, once, in case it changed
+    if ((!hello.id || hello.id === CFG.self.id) && hello.boot !== CFG.boot && store('pencilpad-boot') !== hello.boot) {
+      store('pencilpad-boot', hello.boot); location.reload();
+    }
+  };
+}
+function reconnect() { const old = ws; ws = null; cur = null; if (old) old.close(); resetInput(); setOnline(false); connect(); }
+// back on screen while on the second-choice Mac: go back to the first choice if it is there
+async function backToFirstChoice() {
+  const first = macs.find(m => m.id === preferred());
+  if (!cur || !first || cur.id === first.id || finding) return;
+  if (await find([first], 1200) && cur && cur.id !== first.id) reconnect();
 }
 function send(o) {
   if (tour) { tourSaw(o); if (PRACTICE.has(o.t)) return true; }   // the tour only practises clicks and keys
@@ -845,8 +1480,41 @@ function send(o) {
   ws.send(JSON.stringify(o)); return true;
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) resetInput(); else connect();
+  if (document.hidden) { resetInput(); pickClose(); } else { connect(); backToFirstChoice(); }
 });
+
+// ---- the list of Macs
+const macList = document.getElementById('macList');
+function pickClose() { document.body.classList.remove('picking'); }
+function pickDraw(reach) {
+  macList.textContent = '';
+  for (const m of macs) {
+    const here = cur && cur.id === m.id, ok = here || reach[m.id];
+    const row = document.createElement('div');
+    row.className = 'mac' + (here ? ' cur' : ok === false ? ' gone' : '');
+    const b = document.createElement('b'), st = document.createElement('span');
+    b.textContent = m.name;
+    st.textContent = here ? 'Connected' : ok ? 'Available' : ok === false ? 'Not reachable' : 'Looking…';
+    row.append(b, st);
+    row.addEventListener('pointerdown', e => {
+      e.preventDefault(); e.stopPropagation();
+      pickClose();
+      if (here || ok === false) return;
+      store('pencilpad-mac', m.id); reconnect();
+    });
+    macList.append(row);
+  }
+}
+function pickOpen() {
+  const reach = {};
+  document.getElementById('secure').hidden = SECURE || !CFG.self.tls;
+  document.getElementById('macNote').textContent = macs.length > 1
+    ? 'PencilPad connects to the Mac you chose last, or to another one when that Mac is not reachable.'
+    : SECURE ? 'To add another Mac, pair it with this one. See the README.' : '';
+  pickDraw(reach);
+  document.body.classList.add('picking');
+  for (const m of macs) find([m], 1500).then(t => { reach[m.id] = !!t; if (document.body.classList.contains('picking')) pickDraw(reach); });
+}
 
 // ---- batched movement, one message per frame
 let mvx = 0, mvy = 0, scx = 0, scy = 0, queued = false;
@@ -885,6 +1553,7 @@ function endDrag() { if (g && g.dragging) { send({t:'u'}); g.dragging = false; }
 pad.addEventListener('pointerdown', e => {
   e.preventDefault();
   hover = null;
+  if (document.body.classList.contains('picking')) return pickClose();   // this touch only closes the list
   // palm rejection: while the Pencil is down, ignore fingers
   if (e.pointerType === 'touch' && penDown()) return;
   // the Pencil takes over from fingers; and a primary pointer means nothing else is
@@ -971,7 +1640,6 @@ if (!navigator.standalone) TOUR.push({s:'home', title:'Add PencilPad to your Hom
 const PRACTICE = new Set(['c', 'r', 'd', 'u', 'key', 'shot', 'dict']);
 const tourEl = document.getElementById('tour'), demo = document.getElementById('demo'), dots = document.getElementById('dots');
 let tour = null;         // {i, n, done:[]} while the tour is running
-function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (_) { return null; } }
 function tourShow() {
   const st = TOUR[tour.i];
   tour.n = 0; tour.locked = false;
@@ -1001,7 +1669,9 @@ function tourSaw(o) {
 function press(id, fn) { document.getElementById(id).addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); fn(); }); }
 press('tourSkip', tourNext);
 press('tourEnd', tourEnd);
-press('help', () => tour ? tourEnd() : tourStart());
+press('help', () => { pickClose(); tour ? tourEnd() : tourStart(); });
+press('status', () => document.body.classList.contains('picking') ? pickClose() : pickOpen());
+press('secure', () => { location.href = 'http://' + location.hostname + ':' + CFG.self.port + PATH + '/secure'; });
 
 
 // ---- corners
@@ -1030,21 +1700,88 @@ function flash(el) { el.classList.add('on'); setTimeout(() => el.classList.remov
 corner('esc',  el => { if (send({t:'key', k:'esc'})) flash(el); });
 corner('sub',  el => { if (send({t:'key', k:'return'})) flash(el); });
 corner('shot', el => { if (send({t:'shot'})) flash(el); });
+// Dictate. When the Mac can turn speech into text and this page may use the iPad's
+// microphone, the pad records here and the Mac types what was said. Otherwise the
+// corner presses the Mac's own dictation key.
+const AC = window.AudioContext || window.webkitAudioContext;
+let mic = null;          // {stream, ctx} once the microphone is open
+let rec = null;          // {chunks, n} while recording
+let micIdle = null;
+function micReady() {
+  return !tour && cur && cur.speech && window.isSecureContext && AC && navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+}
+function micClose() { if (!mic) return; for (const t of mic.stream.getTracks()) t.stop(); mic.ctx.close(); mic = null; }
+async function micStart(el) {
+  const mine = rec = {chunks: [], n: 0};
+  el.classList.add('on'); clearTimeout(micIdle);
+  try {
+    if (!mic) {
+      const stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1}});
+      const ctx = new AC();
+      const node = ctx.createScriptProcessor(4096, 1, 1);
+      node.onaudioprocess = e => {
+        if (!rec || rec.n > ctx.sampleRate * 120) return;      // two minutes at most
+        const d = new Float32Array(e.inputBuffer.getChannelData(0)); rec.chunks.push(d); rec.n += d.length;
+      };
+      ctx.createMediaStreamSource(stream).connect(node); node.connect(ctx.destination);
+      mic = {stream, ctx};
+    }
+    if (mic.ctx.state !== 'running') await mic.ctx.resume();
+    if (rec === mine) dictLabel('Listening…');
+  } catch (_) {
+    if (rec === mine) rec = null;
+    el.classList.remove('on'); micClose();
+    dictLabel('Allow the microphone, then try again', 3000);
+  }
+}
+async function micStop(el) {
+  const mine = rec; rec = null;
+  el.classList.remove('on');
+  micIdle = setTimeout(micClose, 90000);
+  if (!mine || !mic || !cur) return dictLabel();
+  if (mine.n < mic.ctx.sampleRate * 0.3) return dictLabel(mine.n ? '' : 'Hold while you speak', 2000);
+  const pcm = new Int16Array(mine.n); let i = 0;
+  for (const c of mine.chunks) for (let j = 0; j < c.length; j++) pcm[i++] = Math.max(-1, Math.min(1, c[j])) * 32767;
+  dictLabel('Typing…');
+  try {
+    const r = await fetch(cur.base + PATH + '/speech?rate=' + Math.round(mic.ctx.sampleRate), {method: 'POST', body: pcm.buffer});
+    const out = await r.json();
+    dictLabel(out.text ? '' : out.error === 'denied' ? 'Allow Speech Recognition on the Mac'
+      : out.error ? 'Could not transcribe' : 'Did not catch that', 2500);
+  } catch (_) { dictLabel('Could not reach the Mac', 2500); }
+}
 if (CFG.dictMode === 'toggle') {
   let on = false;
-  corner('dict', el => { if (!send({t:'dict', s:1})) return; if (tour) return flash(el); on = !on; el.classList.toggle('on', on); });
+  cornerResets.push(() => { if (rec) { rec = null; on = false; dictLabel(); } });
+  corner('dict', el => {
+    if (micReady() || rec) { on = !on; return on ? micStart(el) : micStop(el); }
+    if (!send({t:'dict', s:1})) return; if (tour) return flash(el); on = !on; el.classList.toggle('on', on);
+  });
 } else {
-  corner('dict', el => { if (send({t:'dict', s:1})) el.classList.add('on'); },
-                 el => { el.classList.remove('on'); send({t:'dict', s:0}); });
+  let viaMic = false;
+  corner('dict', el => { viaMic = !!micReady(); if (viaMic) micStart(el); else if (send({t:'dict', s:1})) el.classList.add('on'); },
+                 el => { if (viaMic) micStop(el); else { el.classList.remove('on'); send({t:'dict', s:0}); } });
 }
 
-// ---- start. If the Mac's .local name works from here, switch to it: it survives IP changes.
-(function start() {
-  const ip = /^[0-9.]+$/.test(location.hostname);
-  if (!ip || !CFG.local || location.hostname === '127.0.0.1') return connect();
-  const to = location.protocol + '//' + CFG.local + ':' + location.port + location.pathname;
-  const ctl = new AbortController(); setTimeout(() => ctl.abort(), 1500);
-  fetch(to.replace(/\/$/, '') + '/ping', {signal: ctl.signal}).then(r => r.ok ? location.replace(to) : connect(), connect);
+// ---- start. Move to the best address this page can be loaded from: the secure port
+// once the iPad trusts this Mac's certificate, and the Mac's .local name, which
+// survives IP changes. The Home Screen app stays where it was added.
+(async function start() {
+  if (location.hash === '#toured') { store('pencilpad-tour', '1'); history.replaceState(null, '', location.pathname); }
+  if (SECURE && navigator.serviceWorker) navigator.serviceWorker.register(PATH + '/sw.js', {scope: PATH}).catch(() => {});
+  const host = location.hostname, ip = /^[0-9.]+$/.test(host);
+  if (navigator.standalone || host === '127.0.0.1' || host === 'localhost') return connect();
+  const want = [];
+  const name = ip && CFG.local ? CFG.local : null;
+  if (!SECURE && CFG.self.tls) { if (name) want.push('https://' + name + ':' + CFG.self.tls); want.push('https://' + host + ':' + CFG.self.tls); }
+  if (name) want.push(location.protocol + '//' + name + ':' + location.port);
+  if (!want.length) return connect();
+  const tries = want.map(base => ({base, ok: null}));
+  const to = await new Promise(done => {
+    const settle = () => { for (const t of tries) { if (t.ok) return done(t.base); if (t.ok === null) return; } done(null); };
+    for (const t of tries) probe(t.base, CFG.self.id, 1500).then(ok => { t.ok = ok; settle(); });
+  });
+  if (to) location.replace(to + PATH + (store('pencilpad-tour') ? '#toured' : '')); else connect();
 })();
 
 // ---- keep Safari from scrolling, zooming or selecting

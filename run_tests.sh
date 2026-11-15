@@ -9,7 +9,7 @@ cd "$(dirname "$0")" || exit 1
 if [ ! -f .testvenv/.ready ]; then
   { [ -x .testvenv/bin/python ] || python3 -m venv .testvenv; } \
     && .testvenv/bin/pip install -q pytest aiohttp pyobjc-framework-Quartz \
-         pyobjc-framework-Cocoa segno "playwright==1.59.0" \
+         pyobjc-framework-Cocoa segno cryptography "playwright==1.59.0" \
     && .testvenv/bin/python -m playwright install chromium \
     && touch .testvenv/.ready || exit 1
 fi
