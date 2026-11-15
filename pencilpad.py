@@ -428,6 +428,7 @@ async def state(request):
     check_token(request)
     return web.json_response({
         "clients": len(request.app["clients"]),
+        "url": pad_url(request.app) if is_local(request) else "",
         "access": bool(getattr(Quartz, "CGPreflightPostEventAccess", lambda: True)()),
         "screen": bool(getattr(Quartz, "CGPreflightScreenCaptureAccess", lambda: True)()),
     })
@@ -450,6 +451,19 @@ async def open_settings(request):
     return web.Response(text="ok")
 
 
+async def exit_with_parent(app):
+    """Started by the menu bar app: stop when that app goes away, however it went."""
+    parent = os.getppid()
+
+    async def watch():
+        while os.getppid() == parent:
+            await asyncio.sleep(2)
+        mac.release_all()
+        os._exit(0)
+
+    app["parent_watch"] = asyncio.ensure_future(watch())
+
+
 def main():
     if (DICTATION["mode"] not in ("hold", "toggle") or DICTATION["key"] not in KEYCODES
             or any(m not in MOD_FLAGS for m in DICTATION.get("mods", []))):
@@ -459,9 +473,10 @@ def main():
     trusted = getattr(Quartz, "CGPreflightPostEventAccess", lambda: True)()
     if not trusted and not DRY_RUN:
         getattr(Quartz, "CGRequestPostEventAccess", lambda: None)()
-        print("!! This terminal app does not have Accessibility permission yet.\n"
-              "   Turn it on in System Settings > Privacy & Security > Accessibility,\n"
-              "   then quit and reopen the terminal and run this again.\n"
+        print("!! PencilPad does not have Accessibility permission yet.\n"
+              "   Turn it on in System Settings > Privacy & Security > Accessibility\n"
+              "   (for the PencilPad app, or for the terminal that runs this script),\n"
+              "   then start PencilPad again.\n"
               "   (The pad will connect, but the pointer will not move until then.)\n")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -484,6 +499,8 @@ def main():
     if DRY_RUN:
         app.add_routes([web.get("/{token}/dry", dry_log_handler),
                         web.post("/{token}/dry/drop", dry_drop_handler)])
+    if os.environ.get("PENCILPAD_EXIT_WITH_PARENT"):
+        app.on_startup.append(exit_with_parent)
     setup = f"http://localhost:{PORT}/{token}/connect"
     print("PencilPad is running" + (" (dry run: nothing is sent to this Mac)" if DRY_RUN else "") + ".\n")
     print(f"   Set up your iPad (QR code):  {setup}")

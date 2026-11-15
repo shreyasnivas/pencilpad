@@ -35,6 +35,29 @@ System Settings > Privacy & Security:
 
 The setup page shows whether each one is allowed.
 
+## Menu bar app (optional)
+
+If you would rather not start PencilPad from a terminal, build the small menu
+bar app. It keeps PencilPad running in the background, starts it at login, and
+shows whether the iPad is connected.
+
+```sh
+./app/build.sh
+open /Applications/PencilPad.app
+```
+
+Needs the Xcode command line tools (`xcode-select --install`). Then:
+
+- Allow **Accessibility** for PencilPad when macOS asks. The app restarts the
+  pad by itself once it is allowed.
+- Choose **Start at Login** from the menu.
+- **Show Setup Code** opens the QR code page.
+
+The app is built on your Mac and is not signed with a developer certificate. It
+runs the script from this folder, so keep the folder where it is; if you move
+it, or after an update that changes `app/PencilPad.swift`, run `./app/build.sh`
+again and allow Accessibility again.
+
 ## Gestures
 
 | Do this | To get this |

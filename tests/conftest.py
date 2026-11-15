@@ -54,7 +54,25 @@ def server_env(port, token_file, **extra):
 
 class Server:
     def __init__(self, port=None, extra_env=None):
-        self.port = port or free_port()
+        # An auto-picked port can be taken by something else between the probe and
+        # the server binding it; when that happens, pick another and start again.
+        for attempt in range(5):
+            self._start(port or free_port(), extra_env)
+            deadline = time.time() + 30
+            while self.proc.poll() is None:
+                try:
+                    urllib.request.urlopen(self.url, timeout=1).read()
+                    return
+                except Exception:
+                    if time.time() > deadline:
+                        self.stop()
+                        raise
+                    time.sleep(0.1)
+            if port or attempt == 4 or "already in use" not in self.output():
+                raise RuntimeError("server exited:\n" + self.output())
+
+    def _start(self, port, extra_env):
+        self.port = port
         self.token_file = TMP / f"token-{self.port}"
         self.token_file.write_text(TOKEN)
         self.out_path = TMP / f"server-{self.port}-{time.monotonic_ns()}.log"
@@ -64,18 +82,6 @@ class Server:
                                      stdout=self.out, stderr=subprocess.STDOUT)
         self.base = f"http://127.0.0.1:{self.port}"
         self.url = f"{self.base}/{TOKEN}"
-        deadline = time.time() + 30
-        while True:
-            if self.proc.poll() is not None:
-                raise RuntimeError("server exited:\n" + self.output())
-            try:
-                urllib.request.urlopen(self.url, timeout=1).read()
-                break
-            except Exception:
-                if time.time() > deadline:
-                    self.stop()
-                    raise
-                time.sleep(0.1)
 
     def output(self):
         self.out.flush()
