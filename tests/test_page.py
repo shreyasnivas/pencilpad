@@ -7,10 +7,10 @@ import time
 
 import pytest
 
-from conftest import CENTER, VIEW, Server, corner_xy, evs, open_pad, wait_until
+from conftest import CENTER, VIEW, Server, evs, open_pad, wait_until
 
 POINTER = ("move", "drag", "ldown", "lup", "rdown", "rup", "scroll")
-KEYS = ("keydown", "keyup", "flags", "screencapture")
+KEYS = ("keydown", "keyup", "flags", "screencapture", "missioncontrol")
 CX, CY = CENTER
 
 
@@ -258,26 +258,26 @@ def test_pen_landing_during_finger_drag_releases_button(pad):
     assert set(names[i_up + 1:]) == {"move"}, names    # the pen just moves, no 2nd release
 
 
-def test_corner_ignored_while_pen_down(pad):
+def test_rail_ignored_while_pen_down(pad):
     m = pad.server.mark()
     pad.pen_down(CX, CY)
-    pad.tap(*corner_xy("sub"))
-    pad.tap(*corner_xy("dict"))
+    pad.tap(*pad.center("sub"))
+    pad.tap(*pad.center("dict"))
     pad.pen_up(CX, CY)
     e = settle(pad, m)
     assert evs(e, *KEYS) == []
 
 
-# ------------------------------------------------------------------ corners
+# ------------------------------------------------------------------ the rail
 
-@pytest.mark.parametrize("corner,expected", [
+@pytest.mark.parametrize("key,expected", [
     ("esc", [("keydown", "esc"), ("keyup", "esc")]),
     ("sub", [("keydown", "return"), ("keyup", "return")]),
     ("shot", [("screencapture", None), ("keydown", "v"), ("keyup", "v")]),
 ])
-def test_corner_buttons(pad, corner, expected):
+def test_rail_keys(pad, key, expected):
     m = pad.server.mark()
-    pad.tap(*corner_xy(corner))
+    pad.tap(*pad.center(key))
     e = settle(pad, m, wait=0.8)
     assert [(x["ev"], x.get("key")) for x in e if x["ev"] in KEYS] == expected
     assert evs(e, *POINTER) == []
@@ -285,7 +285,7 @@ def test_corner_buttons(pad, corner, expected):
 
 def test_dictate_hold(pad):
     m = pad.server.mark()
-    pad.down(*corner_xy("dict"))
+    pad.down(*pad.center("dict"))
     pad.server.wait_for(lambda e: "keydown" in evs(e), since=m)
     assert pad.has_class("dict", "on")
     time.sleep(0.5)
@@ -296,9 +296,9 @@ def test_dictate_hold(pad):
     assert not pad.has_class("dict", "on")
 
 
-def test_slide_from_pad_onto_corner_stays_pad_gesture(pad):
+def test_slide_from_pad_onto_rail_stays_pad_gesture(pad):
     m = pad.server.mark()
-    sx, sy = corner_xy("sub")
+    sx, sy = pad.center("sub")
     pad.down(CX, CY)
     pad.drag(1, CX, CY, sx, sy, steps=15)
     pad.up()
@@ -307,15 +307,15 @@ def test_slide_from_pad_onto_corner_stays_pad_gesture(pad):
     assert set(evs(e, *POINTER)) == {"move"}
 
 
-def test_slide_from_corner_onto_pad_stays_corner(pad):
+def test_slide_from_rail_onto_pad_stays_rail_key(pad):
     m = pad.server.mark()
-    ex, ey = corner_xy("esc")
+    ex, ey = pad.center("esc")
     pad.down(ex, ey)
     pad.drag(1, ex, ey, CX, CY, steps=15)
     pad.up()
     e = settle(pad, m)
     assert evs(e, *POINTER) == []
-    assert evs(e, *KEYS) == ["keydown", "keyup"]
+    assert evs([x for x in e if not x.get("repeat")], *KEYS) == ["keydown", "keyup"]   # (held: it repeats)
 
 
 # ------------------------------------------------------------------ connection loss
@@ -323,7 +323,7 @@ def test_slide_from_corner_onto_pad_stays_corner(pad):
 def test_dictate_released_when_socket_drops_mid_hold(pad):
     s = pad.server
     m = s.mark()
-    pad.down(*corner_xy("dict"))
+    pad.down(*pad.center("dict"))
     s.wait_for(lambda e: "keydown" in evs(e), since=m)
     s.drop()
     e = s.wait_for(lambda e: "disconnect" in evs(e), since=m)
@@ -362,7 +362,7 @@ def test_drag_state_reset_when_socket_drops(pad):
 def test_dictate_released_when_page_hidden(pad):
     s = pad.server
     m = s.mark()
-    pad.down(*corner_xy("dict"))
+    pad.down(*pad.center("dict"))
     s.wait_for(lambda e: "keydown" in evs(e), since=m)
     pad.set_hidden(True)
     e = s.wait_for(lambda e: "keyup" in evs(e), since=m, timeout=2)
@@ -398,23 +398,21 @@ def test_returning_to_page_does_not_open_two_sockets(pad):
 
 
 def test_toggle_mode_ui_not_flipped_while_disconnected(browser, server):
-    def to_toggle(page):
-        def handler(route):
-            resp = route.fetch()
-            body = resp.text()
-            assert '"dictMode": "hold"' in body
-            route.fulfill(response=resp, body=body.replace('"dictMode": "hold"', '"dictMode": "toggle"'))
-        page.route(server.url, handler)
-
-    with open_pad(browser, server, route=to_toggle) as p:
-        assert p.text("dictSub") == "Tap to start or stop"
-        p.tap(*corner_xy("dict"))
+    with open_pad(browser, server) as p:
+        p.page.evaluate("setMac('dictation_mode', 'toggle')")          # the Mac's own setting
+        server.wait_for(lambda e: True)
+        p.page.wait_for_function("document.getElementById('dictSub').textContent === 'Tap to start or stop'")
+        m = server.mark()
+        p.tap(*p.center("dict"))
         assert p.has_class("dict", "on")
-        p.tap(*corner_xy("dict"))
+        p.tap(*p.center("dict"))
         assert not p.has_class("dict", "on")
+        # each tap is one press of the key on the Mac
+        e = server.wait_for(lambda e: evs(e).count("keyup") == 2, since=m)
+        assert [x["ev"] for x in e if x["ev"] in ("keydown", "keyup")] == ["keydown", "keyup"] * 2
         server.stop()                  # Mac side gone: the tap cannot be delivered
         p.wait_offline()
-        p.tap(*corner_xy("dict"))
+        p.tap(*p.center("dict"))
         time.sleep(0.2)
         assert not p.has_class("dict", "on")
 
@@ -754,8 +752,8 @@ def test_ring_shows_for_the_pencil_too(pad):
     pad.wait_class("ring", "go", False)
 
 
-def test_ring_not_shown_for_a_corner_press(pad):
-    pad.down(*corner_xy("dict"))
+def test_ring_not_shown_for_a_rail_press(pad):
+    pad.down(*pad.center("dict"))
     time.sleep(0.7)
     assert not pad.has_class("ring", "go") and not pad.has_class("pad", "armed")
     pad.up()

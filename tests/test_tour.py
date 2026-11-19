@@ -1,7 +1,7 @@
 """The first-run guided tour, in a real browser with real touch input.
 
 The tour starts by itself the first time the pad connects. Each step waits for
-one gesture; clicks, drags and corner keys made while it runs are practice and
+one gesture; clicks, drags and rail keys made while it runs are practice and
 must not reach the Mac, while pointer moves and scrolling do.
 """
 
@@ -9,19 +9,21 @@ import time
 
 import pytest
 
-from conftest import CONNECTED, ONLINE, VIEW, corner_xy, evs, open_pad
+from conftest import CONNECTED, ONLINE, VIEW, evs, open_pad
 
-STEPS = ["move", "tap", "hold", "drag", "scroll", "corners", "home"]
+STEPS = ["move", "tap", "hold", "drag", "scroll", "rail", "done"]
 TITLES = {
     "move": "Drag to move the pointer", "tap": "Tap to click",
     "hold": "Hold, then lift to right-click", "drag": "Hold, then slide to drag",
-    "scroll": "Two fingers to scroll", "corners": "The corners are keys",
-    "home": "Add PencilPad to your Home Screen",
+    "scroll": "Two fingers to scroll", "rail": "Your keys are on the left",
+    "done": "That’s it",
 }
 # what a practice gesture would have posted had it been sent to the Mac
-PRACTICE = ("ldown", "lup", "rdown", "rup", "drag", "keydown", "keyup", "flags", "screencapture")
-# a clear part of the pad: left of the tour card, between the Escape and Dictate corners
-FX, FY = 200, 410
+PRACTICE = ("ldown", "lup", "rdown", "rup", "drag", "keydown", "keyup", "flags", "screencapture",
+            "missioncontrol")
+# a clear part of the pad: between the rail and the tour card
+FX, FY = 300, 410
+RAIL = ["esc", "space", "sub", "copy", "paste", "dict", "shot", "mc", "app", "kbd"]
 STANDALONE = "Object.defineProperty(Navigator.prototype, 'standalone', {get: () => true});"
 
 
@@ -102,12 +104,12 @@ def do_scroll(pad):
     slide_until_done(pad, {1: (FX - 50, FY + 60), 2: (FX + 50, FY + 60)})
 
 
-def do_corner(pad, name="esc"):
-    pad.tap(*corner_xy(name))
+def do_rail(pad, name="esc"):
+    pad.tap(*pad.center(name))
 
 
 GESTURE = {"move": do_move, "tap": do_tap, "hold": do_hold, "drag": do_drag,
-           "scroll": do_scroll, "corners": do_corner}
+           "scroll": do_scroll, "rail": do_rail}
 
 
 # ------------------------------------------------------------------ starting
@@ -203,7 +205,7 @@ def test_wrong_gesture_does_not_complete_a_step(first_run):
     p = first_run
     m = p.server.mark()
     do_tap(p)                                      # step 1 wants a move, not a tap
-    do_corner(p, "sub")
+    do_rail(p, "sub")
     time.sleep(0.3)
     assert p.tour_step() == "move" and not p.step_done()
     skip_to(p, "tap")
@@ -224,15 +226,37 @@ def test_move_step_needs_more_than_a_flick(first_run):
     assert p.tour_step() == "move" and not p.step_done()
 
 
-@pytest.mark.parametrize("corner", ["esc", "shot", "dict", "sub"])
-def test_any_corner_completes_the_corners_step(first_run, corner):
+@pytest.mark.parametrize("key", RAIL)
+def test_any_rail_key_completes_the_rail_step(first_run, key):
     p = first_run
-    skip_to(p, "corners")
+    skip_to(p, "rail")
+    assert p.text("tourNote") == "Practice only: this is not sent to your Mac."
     m = p.server.mark()
-    do_corner(p, corner)
+    do_rail(p, key)
     p.wait_step_done()
-    p.wait_step("home")
+    p.wait_step("done")
     assert evs(settle(p, m, 0.6), *PRACTICE) == []
+    assert not p.typing()                          # the Keyboard key does not take the trackpad away
+
+
+def test_rail_step_unfolds_a_folded_rail(browser, server):
+    init = ["try { localStorage.setItem('pencilpad-rail', 'collapsed'); } catch (_) {}"]
+    with open_pad(browser, server, init=init, tour_seen=False) as p:
+        assert p.page.evaluate("document.body.classList.contains('collapsed')")
+        skip_to(p, "rail")
+        p.page.wait_for_function("getComputedStyle(document.querySelector('#rail .keys')).visibility === 'visible'")
+        assert p.text("tourText") == ("Big keys down the left edge, made to hit without looking. "
+                                      "Press any of them. The arrow at the bottom folds them away.")
+        do_rail(p, "copy")
+        p.wait_step_done()
+
+
+def test_rail_step_on_the_right(browser, server):
+    with open_pad(browser, server, init=["try { localStorage.setItem('pencilpad-side', 'right'); } catch (_) {}"],
+                  tour_seen=False) as p:
+        skip_to(p, "rail")
+        assert p.text("tourTitle") == "Your keys are on the right"
+        assert p.text("tourText").startswith("Big keys down the right edge")
 
 
 def test_two_finger_tap_also_completes_the_hold_step(first_run):
@@ -250,7 +274,7 @@ def test_two_finger_tap_also_completes_the_hold_step(first_run):
 
 
 def test_practice_gestures_record_nothing_on_the_server(first_run):
-    """Every click-like gesture and every corner, while the tour runs."""
+    """Every click-like gesture and every rail key, while the tour runs."""
     p = first_run
     m = p.server.mark()
     do_tap(p)
@@ -265,9 +289,9 @@ def test_practice_gestures_record_nothing_on_the_server(first_run):
     p.pen_down(FX, FY)                             # Pencil tap
     time.sleep(0.05)
     p.pen_up(FX, FY)
-    for c in ("esc", "sub", "shot"):
-        do_corner(p, c)
-    p.down(*corner_xy("dict"))                     # Dictate, held then let go
+    for c in ("esc", "space", "sub", "copy", "paste", "shot", "mc", "app", "kbd"):
+        do_rail(p, c)
+    p.down(*p.center("dict"))                     # Dictate, held then let go
     p.wait_class("dict", "on")
     time.sleep(0.2)
     p.up()
@@ -307,15 +331,15 @@ def test_skip_moves_on_without_ticking_the_step(first_run):
 
 def test_last_step_is_manual_and_done_finishes(first_run):
     p = first_run
-    skip_to(p, "home")
+    skip_to(p, "done")
     assert step_label(p) == "Step 7 of 7"
-    assert p.text("tourTitle") == TITLES["home"]
+    assert p.text("tourTitle") == TITLES["done"]
     assert p.text("tourSkip") == "Done" and p.has_class("tourSkip", "primary")
     assert p.text("tourNote") == ""
     do_tap(p)                                      # no gesture completes this step
-    do_corner(p, "esc")
+    do_rail(p, "esc")
     time.sleep(0.3)
-    assert p.tour_step() == "home" and not p.step_done()
+    assert p.tour_step() == "done" and not p.step_done()
     assert stored(p) is None
     p.press("tourSkip")
     p.wait_step(None)
@@ -324,7 +348,7 @@ def test_last_step_is_manual_and_done_finishes(first_run):
 
 def test_skip_button_label_resets_after_reopening(first_run):
     p = first_run
-    skip_to(p, "home")
+    skip_to(p, "done")
     p.press("tourSkip")
     p.wait_step(None)
     p.press("help")
@@ -346,7 +370,7 @@ def test_end_tour_button(first_run):
     do_tap(p)
     e = p.server.wait_for(lambda e: "lup" in evs(e), since=m)
     assert evs(e, *PRACTICE) == ["ldown", "lup"]
-    do_corner(p, "esc")
+    do_rail(p, "esc")
     p.server.wait_for(lambda e: "keyup" in evs(e), since=m)
 
 
@@ -386,7 +410,7 @@ def test_opening_the_tour_releases_a_held_dictate_key(pad):
     """Dictate held for real, then the tour opens: the key must not stay down."""
     s = pad.server
     m = s.mark()
-    pad.down(*corner_xy("dict"), id=1)
+    pad.down(*pad.center("dict"), id=1)
     s.wait_for(lambda e: "keydown" in evs(e), since=m)
     pad.press("help", id=2)
     pad.wait_step("move")
@@ -421,7 +445,7 @@ def test_whole_tour_by_gestures_then_it_stays_away(first_run):
         p.wait_step(step)
         GESTURE[step](p)
         p.wait_step_done()
-    p.wait_step("home")
+    p.wait_step("done")
     assert dots(p) == ["ok"] * 6 + ["cur"]
     assert stored(p) is None
     p.press("tourSkip")                            # "Done"
@@ -447,12 +471,12 @@ def test_whole_tour_by_gestures_then_it_stays_away(first_run):
 
 def test_home_screen_app_has_no_home_screen_step(browser, server):
     """Opened from the Home Screen (navigator.standalone) the tour has six steps
-    and ends by itself after the corners step."""
+    and ends by itself after the rail step."""
     with open_pad(browser, server, tour_seen=False, init=[STANDALONE]) as p:
         assert step_label(p) == "Step 1 of 6"
-        skip_to(p, "corners")
+        skip_to(p, "rail")
         assert step_label(p) == "Step 6 of 6"
-        do_corner(p, "sub")
+        do_rail(p, "sub")
         p.wait_step_done()
         p.wait_step(None)
         assert stored(p) == "1"
@@ -487,7 +511,7 @@ def test_reopened_tour_is_not_advanced_by_a_stale_timer(first_run):
 def test_ending_tour_with_dictate_held_sends_no_stray_key(first_run):
     p = first_run
     m = p.server.mark()
-    p.down(*corner_xy("dict"), id=1)               # practice press: nothing sent
+    p.down(*p.center("dict"), id=1)               # practice press: nothing sent
     p.wait_class("dict", "on")
     p.press("tourEnd", id=2)
     p.wait_step(None)

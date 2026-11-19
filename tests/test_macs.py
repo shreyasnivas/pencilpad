@@ -13,7 +13,7 @@ import urllib.request
 
 import pytest
 
-from conftest import SCRIPT, TMP, TOKEN, Server, corner_xy, evs, free_port, open_pad, server_env, wait_until
+from conftest import SCRIPT, TMP, TOKEN, Server, evs, free_port, open_pad, server_env, wait_until
 
 FAKE = TMP / "fake-transcribe.sh"
 
@@ -65,7 +65,7 @@ def test_pair_rejects_a_link_that_is_not_pencilpad(server):
     done = pair_cli(free_port(), "http://127.0.0.1:9/nothing")
     assert done.returncode != 0 and "Could not reach" in done.stderr
     done = pair_cli(free_port(), "not a link")
-    assert done.returncode != 0 and "not a PencilPad link" in done.stderr
+    assert done.returncode != 0 and "isn't a PencilPad link" in done.stderr
 
 
 def test_peer_needs_the_token_and_a_sane_record(server):
@@ -75,7 +75,7 @@ def test_peer_needs_the_token_and_a_sane_record(server):
     for bad in (b"{}", b"nonsense", json.dumps({"id": "x", "hosts": [], "port": 1}).encode(),
                 json.dumps({"id": "x", "hosts": ["h"], "port": 99999}).encode()):
         with pytest.raises(urllib.error.HTTPError) as e:
-            post(server.url + "/peer", bad)
+            post(server.url + "/peer", bad, {"Content-Type": "application/json"})
         assert e.value.code == 400
     assert json.loads(server.get("/macs")[2])["peers"] == []
 
@@ -153,9 +153,11 @@ def test_dictate_uses_the_ipad_microphone(browser, speech_server):
     with open_pad(browser, s) as p:
         p.page.wait_for_function("cur && cur.speech")
         m = s.mark()
-        p.down(*corner_xy("dict"))
+        p.down(*p.center("dict"))
         p.page.wait_for_function("document.getElementById('dictSub').textContent === 'Listening…'")
-        time.sleep(0.7)
+        # "Listening…" shows when the microphone starts, not when audio arrives: hold until
+        # the pad really has 0.4 s of it (it sends nothing under 0.3 s)
+        p.page.wait_for_function("rec && mic && rec.n / mic.ctx.sampleRate >= 0.4", timeout=8000)
         p.up()
         got = s.wait_for(lambda e: "text" in evs(e), since=m, timeout=8)
         assert [e["s"] for e in got if e["ev"] == "text"] == ["hello from the iPad "]
@@ -164,19 +166,38 @@ def test_dictate_uses_the_ipad_microphone(browser, speech_server):
         assert not p.has_class("dict", "on")
 
 
+def test_dictate_with_the_macs_app_never_opens_the_microphone(browser, speech_server):
+    """Source "Mac's dictation app": Dictate presses the key even when the iPad could record."""
+    s = speech_server
+    with open_pad(browser, s) as p:
+        p.page.wait_for_function("cur && cur.speech")
+        p.page.evaluate("""() => { window.__mic = 0; const gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+            navigator.mediaDevices.getUserMedia = c => { window.__mic++; return gum(c); }; }""")
+        p.page.evaluate("setMac('dictation_source', 'mac')")
+        s.wait_for(lambda e: True)
+        time.sleep(0.2)
+        m = s.mark()
+        p.down(*p.center("dict"))
+        s.wait_for(lambda e: "keydown" in evs(e), since=m)
+        p.up()
+        e = s.wait_for(lambda e: "keyup" in evs(e), since=m)
+        assert [x["key"] for x in e if x["ev"] == "keydown"] == ["f13"] and "text" not in evs(e)
+        assert p.page.evaluate("window.__mic") == 0 and p.page.evaluate("mic") is None
+
+
 def test_dictate_released_at_once_sends_nothing(browser, speech_server):
     s = speech_server
     with open_pad(browser, s) as p:
         p.page.wait_for_function("cur && cur.speech")
         m = s.mark()
-        p.tap(*corner_xy("dict"), hold=0.02)
+        p.tap(*p.center("dict"), hold=0.02)
         time.sleep(1.0)
         assert evs(s.log(m), "text", "keydown") == []
 
 
 def test_dictate_presses_the_key_without_a_transcriber(pad):
     m = pad.server.mark()
-    pad.down(*corner_xy("dict"))
+    pad.down(*pad.center("dict"))
     pad.server.wait_for(lambda e: "keydown" in evs(e), since=m)
     pad.up()
     pad.server.wait_for(lambda e: "keyup" in evs(e), since=m)

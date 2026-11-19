@@ -9,7 +9,7 @@ import ApplicationServices
 import Speech
 
 // "PencilPad --transcribe file.wav": print what was said in a recording, then exit.
-// The Python script runs this for the Dictate corner when the iPad's microphone is used.
+// The Python script runs this for the Dictate key when the iPad's microphone is used.
 // Exit code 3 means Speech Recognition is not allowed for PencilPad.
 if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--transcribe" {
     let file = URL(fileURLWithPath: CommandLine.arguments[2])
@@ -53,7 +53,13 @@ final class App: NSObject, NSApplicationDelegate {
 
     // where the script lives: written into the app by build.sh
     let repo: String = (Bundle.main.object(forInfoDictionaryKey: "PencilPadRepo") as? String) ?? ""
-    var port: String { ProcessInfo.processInfo.environment["PENCILPAD_PORT"] ?? "8765" }
+    // the port: PENCILPAD_PORT, else the one the script saved on its first run (read each
+    // time, so a port it chose then is picked up), else 8765
+    var port: String {
+        if let p = ProcessInfo.processInfo.environment["PENCILPAD_PORT"], !p.isEmpty { return p }
+        let saved = try? String(contentsOf: home.appendingPathComponent(".pencilpad/port"), encoding: .utf8)
+        return Int((saved ?? "").trimmingCharacters(in: .whitespacesAndNewlines)).map(String.init) ?? "8765"
+    }
     var token: String {
         let t = try? String(contentsOf: home.appendingPathComponent(".pencilpad-token"), encoding: .utf8)
         return (t ?? "").trimmingCharacters(in: .whitespacesAndNewlines)

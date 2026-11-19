@@ -57,7 +57,8 @@ def server_env(port, token_file, **extra):
 
 
 class Server:
-    def __init__(self, port=None, extra_env=None):
+    def __init__(self, port=None, extra_env=None, token=TOKEN):
+        self.token = token
         # An auto-picked port can be taken by something else between the probe and
         # the server binding it; when that happens, pick another and start again.
         for attempt in range(5):
@@ -72,20 +73,21 @@ class Server:
                         self.stop()
                         raise
                     time.sleep(0.1)
-            if port or attempt == 4 or "already in use" not in self.output():
+            # (either wording: "already in use", or "in use by another program")
+            if port or attempt == 4 or "in use" not in self.output():
                 raise RuntimeError("server exited:\n" + self.output())
 
     def _start(self, port, extra_env):
         self.port = port
         self.token_file = TMP / f"token-{self.port}"
-        self.token_file.write_text(TOKEN)
+        self.token_file.write_text(self.token)
         self.out_path = TMP / f"server-{self.port}-{time.monotonic_ns()}.log"
         env = server_env(self.port, self.token_file, **(extra_env or {}))
         self.out = open(self.out_path, "w")
         self.proc = subprocess.Popen([sys.executable, str(SCRIPT)], env=env, cwd=TMP,
                                      stdout=self.out, stderr=subprocess.STDOUT)
         self.base = f"http://127.0.0.1:{self.port}"
-        self.url = f"{self.base}/{TOKEN}"
+        self.url = f"{self.base}/{self.token}"
 
     def output(self):
         self.out.flush()
@@ -271,8 +273,17 @@ class Pad:
             " return [r.x + r.width / 2, r.y + r.height / 2]; }", el_id))
 
     def press(self, el_id, id=9):
-        """Touch an on-screen button (tour buttons, the ? button)."""
+        """Touch an on-screen button (tour buttons, the ? button, a rail key)."""
         self.tap(*self.center(el_id), id=id)
+
+    def cap(self, k, n=0):
+        """Middle of key `k` (its data-k name) on the pad's keyboard; n: which, of two."""
+        return tuple(self.page.evaluate(
+            "([k, n]) => { const r = document.querySelectorAll('#keyboard .cap[data-k=\"' + k + '\"]')[n]"
+            ".getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }", [k, n]))
+
+    def typing(self):
+        return self.page.evaluate("document.body.classList.contains('typing')")
 
     def wait_online(self, timeout=8000):
         self.page.wait_for_function(ONLINE, timeout=timeout)
@@ -319,22 +330,16 @@ class Pad:
         return self.has_class("demo", "ok")
 
 
-def corner_xy(name):
-    w, h = VIEW["width"], VIEW["height"]
-    return {"esc": (60, 60), "shot": (w - 60, 60),
-            "dict": (60, h - 60), "sub": (w - 60, h - 60)}[name]
-
-
 @contextmanager
 def open_pad(browser, server, tour_seen=True, init=(), route=None, url=None, connected=True,
-             settled=True):
+             settled=True, view=VIEW):
     """A fresh browser context with the pad page open.
 
     tour_seen=True marks the first-run tour as already done (before the page's
     own script runs) so that gestures go to the server; False gives a first-run
     page, where the tour starts on connect.
     """
-    ctx = browser.new_context(has_touch=True, viewport=VIEW)
+    ctx = browser.new_context(has_touch=True, viewport=view)
     if tour_seen:
         ctx.add_init_script(TOUR_SEEN)
     for script in init:

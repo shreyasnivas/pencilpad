@@ -5,9 +5,11 @@
 # The first run creates .testvenv here and downloads Chromium for Playwright.
 #   ./run_tests.sh                 everything
 #   ./run_tests.sh -k tour         only tests whose name matches
-cd "$(dirname "$0")" || exit 1
+cd "${0:A:h}" || exit 1          # (the real folder, even through a link)
+source ./find_python.sh
+venv_ok .testvenv || rm -f .testvenv/.ready       # made with an older Python, or half made: again
 if [ ! -f .testvenv/.ready ]; then
-  { [ -x .testvenv/bin/python ] || python3 -m venv .testvenv; } \
+  make_venv .testvenv \
     && .testvenv/bin/pip install -q pytest aiohttp pyobjc-framework-Quartz \
          pyobjc-framework-Cocoa segno cryptography "playwright==1.59.0" \
     && .testvenv/bin/python -m playwright install chromium \

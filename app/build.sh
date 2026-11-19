@@ -4,9 +4,10 @@
 # The app runs pencilpad.py from this checkout, so keep the folder where it is;
 # after moving it, run this script again.
 set -e
-cd "$(dirname "$0")/.."
+cd "${0:A:h}/.."
 REPO="$PWD"
-[ -x .venv/bin/python ] || python3 -m venv .venv
+source ./find_python.sh
+make_venv .venv
 .venv/bin/python -c "import aiohttp, Quartz, AppKit, segno, cryptography" 2>/dev/null || .venv/bin/pip install -q -r requirements.txt
 
 DEST=/Applications
